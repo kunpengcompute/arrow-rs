@@ -287,6 +287,152 @@ impl RleEncoder {
 /// Size, in number of `i32s` of buffer to use for RLE batch reading
 const RLE_DECODER_INDEX_BUFFER_SIZE: usize = 1024;
 
+#[cfg(target_arch = "aarch64")]
+mod sve_gather {
+    use std::arch::asm;
+    use std::mem::size_of;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    const UNCHECKED: u8 = 0;
+    const SUPPORTED: u8 = 1;
+    const UNSUPPORTED: u8 = 2;
+
+    static SVE_STATUS: AtomicU8 = AtomicU8::new(UNCHECKED);
+
+    #[inline]
+    fn sve_available() -> bool {
+        let status = SVE_STATUS.load(Ordering::Relaxed);
+        if status != UNCHECKED {
+            return status == SUPPORTED;
+        }
+        let available = std::arch::is_aarch64_feature_detected!("sve");
+        SVE_STATUS.store(
+            if available { SUPPORTED } else { UNSUPPORTED },
+            Ordering::Relaxed,
+        );
+        available
+    }
+
+    /// Gather 4-byte elements from `dict` using indices, writing to `output`.
+    ///
+    /// # Safety
+    /// - `dict` must be valid for reads up to `dict[max(indices)]`
+    /// - `indices` must point to `count` valid i32 values
+    /// - `output` must point to `count` writable 4-byte slots
+    /// - SVE feature must be available
+    #[target_feature(enable = "sve")]
+    unsafe fn gather_4byte(
+        dict: *const u8,
+        indices: *const i32,
+        output: *mut u8,
+        count: usize,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let mut pos: usize = 0;
+        asm!(
+            "whilelt p0.s, {pos}, {count}",
+            "2:",
+            "ld1w {{z0.s}}, p0/z, [{idx}, {pos}, lsl #2]",
+            "ld1w {{z1.s}}, p0/z, [{dict}, z0.s, uxtw #2]",
+            "st1w {{z1.s}}, p0, [{out}, {pos}, lsl #2]",
+            "incw {pos}",
+            "whilelt p0.s, {pos}, {count}",
+            "b.first 2b",
+            pos = inout(reg) pos,
+            count = in(reg) count,
+            idx = in(reg) indices,
+            dict = in(reg) dict,
+            out = in(reg) output,
+            options(nostack)
+        );
+    }
+
+    /// Gather 8-byte elements from `dict` using i32 indices, writing to `output`.
+    ///
+    /// # Safety
+    /// - `dict` must be valid for reads up to `dict[max(indices)]`
+    /// - `indices` must point to `count` valid i32 values
+    /// - `output` must point to `count` writable 8-byte slots
+    /// - SVE feature must be available
+    #[target_feature(enable = "sve")]
+    unsafe fn gather_8byte(
+        dict: *const u8,
+        indices: *const i32,
+        output: *mut u8,
+        count: usize,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let mut pos: usize = 0;
+        let mut idx_pos: usize = 0;
+        asm!(
+            "whilelt p0.d, {pos}, {count}",
+            "2:",
+            "ld1sw {{z0.d}}, p0/z, [{idx}, {idx_pos}, lsl #2]",
+            "ld1d {{z1.d}}, p0/z, [{dict}, z0.d, lsl #3]",
+            "st1d {{z1.d}}, p0, [{out}, {pos}, lsl #3]",
+            "incd {pos}",
+            "incd {idx_pos}",
+            "whilelt p0.d, {pos}, {count}",
+            "b.first 2b",
+            pos = inout(reg) pos,
+            idx_pos = inout(reg) idx_pos,
+            count = in(reg) count,
+            idx = in(reg) indices,
+            dict = in(reg) dict,
+            out = in(reg) output,
+            options(nostack)
+        );
+    }
+
+    /// Try to gather dictionary values using SVE instructions.
+    /// Returns `true` if SVE was used, `false` if caller should use scalar fallback.
+    ///
+    /// Only activates for 4-byte (i32/f32) and 8-byte (i64/f64) types on SVE hardware.
+    #[inline]
+    pub fn try_gather<T: Clone>(
+        dict: &[T],
+        indices: &[i32],
+        buffer: &mut [T],
+    ) -> bool {
+        if !sve_available() {
+            return false;
+        }
+
+        let count = indices.len();
+        assert!(buffer.len() >= count);
+
+        match size_of::<T>() {
+            4 => {
+                unsafe {
+                    gather_4byte(
+                        dict.as_ptr() as *const u8,
+                        indices.as_ptr(),
+                        buffer.as_mut_ptr() as *mut u8,
+                        count,
+                    );
+                }
+                true
+            }
+            8 => {
+                unsafe {
+                    gather_8byte(
+                        dict.as_ptr() as *const u8,
+                        indices.as_ptr(),
+                        buffer.as_mut_ptr() as *mut u8,
+                        count,
+                    );
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// A RLE/Bit-Packing hybrid decoder.
 pub struct RleDecoder {
     // Number of bits used to encode the value. Must be between [0, 64].
@@ -494,10 +640,26 @@ impl RleDecoder {
                         self.bit_packed_left = 0;
                         break;
                     }
-                    buffer[values_read..values_read + num_values]
-                        .iter_mut()
-                        .zip(index_buf[..num_values].iter())
-                        .for_each(|(b, i)| b.clone_from(&dict[*i as usize]));
+                    let gathered = {
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            sve_gather::try_gather(
+                                dict,
+                                &index_buf[..num_values],
+                                &mut buffer[values_read..values_read + num_values],
+                            )
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        {
+                            false
+                        }
+                    };
+                    if !gathered {
+                        buffer[values_read..values_read + num_values]
+                            .iter_mut()
+                            .zip(index_buf[..num_values].iter())
+                            .for_each(|(b, i)| b.clone_from(&dict[*i as usize]));
+                    }
                     self.bit_packed_left -= num_values as u32;
                     values_read += num_values;
                     if num_values < to_read {
@@ -1065,3 +1227,4 @@ mod tests {
         }
     }
 }
+
