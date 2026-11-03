@@ -610,6 +610,107 @@ fn filter_boolean(array: &BooleanArray, predicate: &FilterPredicate) -> BooleanA
     BooleanArray::from(data)
 }
 
+// aarch64 SVE gather for the IndexIterator (sparse, selectivity <= 0.8) filter path.
+// That path is `out[i] = values[indices[i]]` -- a gather, which SVE accelerates. Only
+// 4/8-byte natives; runtime-detected with a scalar fallback. aarch64-only so x86/EPYC
+// is unchanged.
+#[cfg(target_arch = "aarch64")]
+mod sve_filter {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer};
+
+    static SVE: AtomicU8 = AtomicU8::new(0);
+
+    #[inline]
+    pub(super) fn available() -> bool {
+        match SVE.load(Ordering::Relaxed) {
+            0 => {
+                let ok = std::arch::is_aarch64_feature_detected!("sve");
+                SVE.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+                ok
+            }
+            s => s == 1,
+        }
+    }
+
+    /// Gather `values[indices[i]]` into a fresh buffer for 4/8-byte native types.
+    /// `indices` must all be `< values.len()` (the filter predicate guarantees this).
+    pub(super) fn gather_buffer<T: ArrowNativeType>(
+        values: &[T],
+        indices: &[u64],
+        sz: usize,
+    ) -> Buffer {
+        let n = indices.len();
+        let mut out = MutableBuffer::with_capacity(n * sz);
+        // SAFETY: the gather writes exactly n*sz bytes (all n outputs).
+        unsafe { out.set_len(n * sz) };
+        let base = values.as_ptr() as *const u8;
+        let out_ptr = out.as_mut_ptr();
+        // SAFETY: caller ensured SVE is present and every index < values.len(), so each
+        // gather address `base + idx*sz` is in bounds; `out` holds n `sz`-byte elements.
+        unsafe {
+            match sz {
+                8 => gather8(base, indices.as_ptr(), out_ptr, n),
+                _ => gather4(base, indices.as_ptr(), out_ptr, n),
+            }
+        }
+        out.into()
+    }
+
+    // SAFETY (both kernels): SVE is available; every index in `idx[0..count]` is within
+    // the source; `out` has room for `count` elements. z0/z1/p0 appear only in the asm
+    // string (no SVE state live across the call), matching the project's validated SVE
+    // template.
+    #[target_feature(enable = "sve")]
+    unsafe fn gather8(base: *const u8, idx: *const u64, out: *mut u8, count: usize) {
+        let mut pos: usize = 0;
+        unsafe {
+            core::arch::asm!(
+                "whilelt p0.d, {pos}, {count}",
+                "2:",
+                "ld1d {{z0.d}}, p0/z, [{idx}, {pos}, lsl #3]",
+                "ld1d {{z1.d}}, p0/z, [{base}, z0.d, lsl #3]",
+                "st1d {{z1.d}}, p0, [{out}, {pos}, lsl #3]",
+                "incd {pos}",
+                "whilelt p0.d, {pos}, {count}",
+                "b.first 2b",
+                pos = inout(reg) pos,
+                count = in(reg) count,
+                idx = in(reg) idx,
+                base = in(reg) base,
+                out = in(reg) out,
+                options(nostack),
+            );
+        }
+        let _ = pos;
+    }
+
+    #[target_feature(enable = "sve")]
+    unsafe fn gather4(base: *const u8, idx: *const u64, out: *mut u8, count: usize) {
+        let mut pos: usize = 0;
+        unsafe {
+            core::arch::asm!(
+                "whilelt p0.d, {pos}, {count}",
+                "2:",
+                "ld1d {{z0.d}}, p0/z, [{idx}, {pos}, lsl #3]",
+                "ld1w {{z1.d}}, p0/z, [{base}, z0.d, lsl #2]",
+                "st1w {{z1.d}}, p0, [{out}, {pos}, lsl #2]",
+                "incd {pos}",
+                "whilelt p0.d, {pos}, {count}",
+                "b.first 2b",
+                pos = inout(reg) pos,
+                count = in(reg) count,
+                idx = in(reg) idx,
+                base = in(reg) base,
+                out = in(reg) out,
+                options(nostack),
+            );
+        }
+        let _ = pos;
+    }
+}
+
 #[inline(never)]
 fn filter_native<T: ArrowNativeType>(values: &[T], predicate: &FilterPredicate) -> Buffer {
     assert!(values.len() >= predicate.filter.len());
@@ -632,6 +733,17 @@ fn filter_native<T: ArrowNativeType>(values: &[T], predicate: &FilterPredicate) 
             buffer.into()
         }
         IterationStrategy::IndexIterator => {
+            // aarch64: SVE-gather the selected elements for 4/8-byte natives.
+            #[cfg(target_arch = "aarch64")]
+            {
+                let sz = std::mem::size_of::<T>();
+                if (sz == 4 || sz == 8) && sve_filter::available() {
+                    let indices: Vec<u64> = IndexIterator::new(&predicate.filter, predicate.count)
+                        .map(|x| x as u64)
+                        .collect();
+                    return sve_filter::gather_buffer(values, &indices, sz);
+                }
+            }
             // SAFETY: indices were derived from the filter predicate
             let iter = IndexIterator::new(&predicate.filter, predicate.count)
                 .map(|x| unsafe { *values.get_unchecked(x) });
@@ -1081,6 +1193,35 @@ mod tests {
         TimestampNanosecondArray,
         TimestampNanosecondArray::from(vec![1, 2, 3, 4])
     );
+
+    #[test]
+    fn sve_filter_gather_matches_scalar() {
+        // ~25% selectivity (< 0.8) -> IndexIterator path -> SVE gather on aarch64.
+        // 8-byte (Int64) and 4-byte (Int32), 1000 elems to cover the SVE loop + tail.
+        let n = 1000usize;
+        let predicate = BooleanArray::from((0..n).map(|i| i % 4 == 0).collect::<Vec<bool>>());
+
+        let v64 = Int64Array::from((0..n).map(|i| (i as i64) * 7 - 3).collect::<Vec<_>>());
+        let got64: Vec<i64> = filter(&v64, &predicate)
+            .unwrap()
+            .as_primitive::<Int64Type>()
+            .values()
+            .to_vec();
+        let exp64: Vec<i64> = (0..n).filter(|i| i % 4 == 0).map(|i| (i as i64) * 7 - 3).collect();
+        assert_eq!(got64, exp64);
+
+        let v32 = Int32Array::from((0..n).map(|i| (i as i32).wrapping_mul(2_654_435_761u32 as i32)).collect::<Vec<_>>());
+        let got32: Vec<i32> = filter(&v32, &predicate)
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        let exp32: Vec<i32> = (0..n)
+            .filter(|i| i % 4 == 0)
+            .map(|i| (i as i32).wrapping_mul(2_654_435_761u32 as i32))
+            .collect();
+        assert_eq!(got32, exp32);
+    }
 
     #[test]
     fn test_filter_array_slice() {
